@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict
 from copy import deepcopy
 import numpy as np
 import gym
@@ -21,10 +21,13 @@ def identity(x):
     return x
 
 
-class Variable:
+class Constant:
     def __init__(self, id: int, value: float):
         self.id = id
         self.value = value
+
+    def __repr__(self):
+        return f"Constant({self.id} {self.value})"
 
 
 class Node:
@@ -40,7 +43,7 @@ class ComputationNode(Node):
     AGG_FNS = {np.sum, np.prod, np.amin, np.amax}
     ACT_FNS = {relu, np.tanh, np.sin, np.cos, sigmoid, square, np.sqrt, identity}
 
-    def __init__(self, node_id: int, agg_fn, act_fn, bias: float):
+    def __init__(self, node_id: int, agg_fn, act_fn, bias_var: int, sign: float):
         assert agg_fn in self.AGG_FNS
         assert act_fn in self.ACT_FNS
 
@@ -48,34 +51,38 @@ class ComputationNode(Node):
 
         self.agg_fn = agg_fn
         self.act_fn = act_fn
-        self.bias = bias
+        self.sign = sign
+        self.bias_var = bias_var
 
-    def __call__(self, x: np.ndarray):
+    def __call__(self, x: np.ndarray, ctx: Dict[int, float]):
         if self.value is None:
             x = self.agg_fn(x, axis=-1)
-            x += self.bias
+            assert self.sign == 1.0 or self.sign == -1.0
+            x += self.sign * ctx[self.bias_var]
             x = self.act_fn(x)
             self.value = x
         return self.value
 
     def __repr__(self):
-        return f"Node({self.id}, {self.act_fn.__name__}({self.agg_fn.__name__}(x) + {self.bias}))"
+        return f"Node({self.id}, {self.act_fn.__name__}({self.agg_fn.__name__}(x) + {int(self.sign)} * V({self.bias_var})))"
 
 
 class Edge:
-    def __init__(self, id: int, from_node_id: int, to_node_id: int, weight: float):
+    def __init__(
+        self, id: int, from_node_id: int, to_node_id: int, weight_var: int, sign: float
+    ):
         self.id = id
         self.from_node_id = from_node_id
         self.to_node_id = to_node_id
-        self.weight = weight
+        self.weight_var = weight_var
+        self.sign = sign
 
-    def __call__(self, x: np.ndarray):
-        return self.weight * x
+    def __call__(self, x: np.ndarray, ctx: Dict[int, float]):
+        assert self.sign == 1.0 or self.sign == -1.0
+        return self.sign * ctx[self.weight_var] * x
 
     def __repr__(self):
-        return (
-            f"Edge({self.id}, {self.from_node_id}->{self.to_node_id}, w={self.weight})"
-        )
+        return f"Edge({self.id}, {self.from_node_id}->{self.to_node_id}, w={int(self.sign)} * V({self.weight_var}))"
 
 
 class ComputationGraph:
@@ -86,6 +93,7 @@ class ComputationGraph:
         hidden_nodes: List[ComputationNode],
         output_nodes: List[ComputationNode],
         edges: List[Edge],
+        variables: List[Constant],
     ):
         assert out_dim == len(output_nodes)
         for i, node in enumerate(output_nodes):
@@ -99,6 +107,9 @@ class ComputationGraph:
         self.out_nodes = output_nodes
         self.node_id += out_dim
         self.hidden_nodes = hidden_nodes
+
+        self.variables = variables
+        self.ctx = {v.id: v.value for v in self.variables}
 
         self.nodes = self.inp_nodes + self.out_nodes + self.hidden_nodes
         self.node_by_id = {node.id: node for node in self.nodes}
@@ -117,6 +128,7 @@ class ComputationGraph:
             list(map(str, self.hidden_nodes))
             + list(map(str, self.out_nodes))
             + list(map(str, self.edges))
+            + list(map(str, self.variables))
         )
         return "\n".join(parts)
 
@@ -180,10 +192,10 @@ class ComputationGraph:
                 # collect input
                 for i, edge_id in enumerate(self.edges_by_to[to_node_id]):
                     edge = self.edge_by_id[edge_id]
-                    inp[:, i] = edge(self.node_by_id[edge.from_node_id].value)
+                    inp[:, i] = edge(self.node_by_id[edge.from_node_id].value, self.ctx)
 
                 # call node
-                self.node_by_id[to_node_id](inp)
+                self.node_by_id[to_node_id](inp, self.ctx)
 
                 # extend frontier
                 for edge_id in self.edges_by_from[to_node_id]:
@@ -224,6 +236,8 @@ def mutate_graph(
     )
     edges = deepcopy(graph.edges)
     next_edge_id = 0 if len(edges) == 0 else max(edge.id for edge in edges) + 1
+    variables = deepcopy(graph.variables)
+    next_variable_id = 0 if len(variables) == 0 else max(v.id for v in variables) + 1
 
     layers = graph.bfs()
 
@@ -231,19 +245,25 @@ def mutate_graph(
         if structure_or_values == 0 and len(hidden_nodes) > 0:
             # chg node
             node = np_random.choice(hidden_nodes + output_nodes)
-            agg_act_bias = np_random.choice([0, 1, 2])
-            if agg_act_bias == 0:
+            agg_act_bias_sign = np_random.choice([0, 1, 2, 3])
+            if agg_act_bias_sign == 0:
                 node.agg_fn = np_random.choice(list(node.AGG_FNS - {node.agg_fn}))
-            elif agg_act_bias == 1:
+            elif agg_act_bias_sign == 1:
                 node.act_fn = np_random.choice(list(node.ACT_FNS - {node.act_fn}))
+            elif agg_act_bias_sign == 2:
+                node.bias_var = np_random.choice(variables).id
             else:
-                node.bias = np.clip(node.bias + np_random.normal(scale=0.1), -1.0, 1.0)
+                node.sign *= -1.0
         else:
             add_or_rem = np_random.choice([0, 1])
             if add_or_rem == 0 or len(hidden_nodes) == 0:
                 # add node
                 # note: not adding edge for now, so it will be disconnected
-                hidden_nodes.append(random_node(np_random, next_node_id))
+                new_variable = Constant(next_variable_id, np_random.uniform(0.0, 1.0))
+                new_node = random_node(np_random, next_node_id, variables + [new_variable])
+                if new_node.bias_var == new_variable.id:
+                    variables.append(new_variable)
+                hidden_nodes.append(new_node)
             else:
                 # rem node (and related edges)
                 ind = np_random.choice(list(range(len(hidden_nodes))))
@@ -255,11 +275,18 @@ def mutate_graph(
                         to_remove.append(edge)
                 for edge in to_remove:
                     edges.remove(edge)
-    else:
+    elif node_or_edge == 1:
         if structure_or_values == 0 and len(edges) > 0:
-            # chg edge weight
+            # chg edge weight variable
             edge = np_random.choice(edges)
-            edge.weight = np_random.uniform(-1.0, 1.0)
+            weight_or_sign = np_random.choice([0, 1])
+            if weight_or_sign == 0:
+                new_variable = Constant(next_variable_id, np_random.uniform(0.0, 1.0))
+                edge.weight_var = np_random.choice(variables + [new_variable]).id
+                if edge.weight_var == new_variable.id:
+                    variables.append(new_variable)
+            else:
+                edge.sign *= -1.0
         else:
             add_or_rem = np_random.choice([0, 1])
             if add_or_rem == 0 or len(edges) == 0:
@@ -273,9 +300,11 @@ def mutate_graph(
                     item for sublist in layers[layer_id + 1 :] for item in sublist
                 ]
                 to_node_id = np_random.choice(nodes_after)
-                weight = np_random.uniform(-1.0, 1.0)
-                edges.append(Edge(next_edge_id, from_node_id, to_node_id, weight))
-
+                variable = np_random.choice(variables).id
+                sign = np_random.choice([-1.0, 1.0])
+                edges.append(
+                    Edge(next_edge_id, from_node_id, to_node_id, variable, sign)
+                )
             else:
                 # rem edge
                 edge_ind = np_random.choice(list(range(len(edges))))
@@ -284,28 +313,41 @@ def mutate_graph(
                 # note: doesn't matter if it disconnects an edge
 
     return ComputationGraph(
-        graph.inp_dim, graph.out_dim, hidden_nodes, output_nodes, edges
+        graph.inp_dim, graph.out_dim, hidden_nodes, output_nodes, edges, variables
     )
 
 
-def random_node(np_random: np.random.RandomState, node_id: int) -> ComputationNode:
+def random_node(
+    np_random: np.random.RandomState, node_id: int, variables: List[Constant]
+) -> ComputationNode:
     return ComputationNode(
         node_id,
         np_random.choice(list(ComputationNode.AGG_FNS)),
         np_random.choice(list(ComputationNode.ACT_FNS)),
-        np_random.uniform(-1.0, 1.0),
+        np_random.choice(variables).id,
+        np_random.choice([1.0, -1.0]),
     )
 
 
 def random_graph(
     np_random: np.random.RandomState, inp_dim: int, out_dim: int, min_mutations: int
 ) -> ComputationGraph:
+    variables = [
+        Constant(0, 0.0),
+        Constant(1, 1.0),
+        Constant(2, 1 / 2),
+        Constant(3, 1 / 3),
+        Constant(4, 1 / 4),
+    ]
     graph = ComputationGraph(
         inp_dim,
         out_dim,
         hidden_nodes=[],
-        output_nodes=[random_node(np_random, inp_dim + i) for i in range(out_dim)],
+        output_nodes=[
+            random_node(np_random, inp_dim + i, variables) for i in range(out_dim)
+        ],
         edges=[],
+        variables=variables,
     )
     for i in range(min_mutations):
         graph = mutate_graph(np_random, graph)
@@ -334,14 +376,19 @@ def cartpole_handcoded_test():
         2,
         hidden_nodes=[],
         output_nodes=[
-            ComputationNode(4, np.sum, relu, 0),
-            ComputationNode(5, np.sum, relu, 0),
+            ComputationNode(4, np.sum, relu, 0, 1.0),
+            ComputationNode(5, np.sum, relu, 0, 1.0),
         ],
         edges=[
-            Edge(0, 2, 5, 1.0),
-            Edge(1, 3, 5, 0.2),
-            Edge(2, 2, 4, -1.0),
-            Edge(3, 3, 4, -0.2),
+            Edge(0, 2, 5, 1, 1.0),
+            Edge(1, 3, 5, 2, 1.0),
+            Edge(2, 2, 4, 1, -1.0),
+            Edge(3, 3, 4, 2, -1.0),
+        ],
+        variables=[
+            Constant(0, 0.0),
+            Constant(1, 1.0),
+            Constant(2, 0.2),
         ],
     )
 
