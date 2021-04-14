@@ -3,6 +3,7 @@ from copy import deepcopy
 import numpy as np
 import gym
 import atexit
+import networkx as nx
 
 
 def relu(x: np.ndarray):
@@ -123,6 +124,12 @@ class ComputationGraph:
             self.edges_by_from[edge.from_node_id].add(edge.id)
             self.edges_by_to[edge.to_node_id].add(edge.id)
 
+        self.g = nx.DiGraph()
+        for id in self.node_by_id:
+            self.g.add_node(id)
+        for edge in self.edges:
+            self.g.add_edge(edge.from_node_id, edge.to_node_id)
+
     def __repr__(self):
         parts = (
             list(map(str, self.hidden_nodes))
@@ -132,40 +139,10 @@ class ComputationGraph:
         )
         return "\n".join(parts)
 
-    def bfs(self):
-        layers = [{node.id for node in self.inp_nodes}]
-
-        disconnected = set(self.node_by_id.keys())
-        disconnected -= layers[0]
-
-        parents_by_node = deepcopy(self.edges_by_to)
-
-        frontier = set()
-        for node in self.inp_nodes:
-            for edge_id in self.edges_by_from[node.id]:
-                edge = self.edge_by_id[edge_id]
-                parents_by_node[edge.to_node_id].discard(edge_id)
-                if len(parents_by_node[edge.to_node_id]) == 0:
-                    frontier.add(edge.to_node_id)
-
-        while len(frontier) > 0:
-            disconnected -= frontier
-            layers.append(frontier)
-            new_frontier = set()
-            for to_node_id in frontier:
-                # extend frontier
-                for edge_id in self.edges_by_from[to_node_id]:
-                    edge = self.edge_by_id[edge_id]
-                    parents_by_node[edge.to_node_id].discard(edge_id)
-                    if len(parents_by_node[edge.to_node_id]) == 0:
-                        new_frontier.add(edge.to_node_id)
-            frontier = new_frontier
-
-        assert len(frontier) == 0
-        assert sum([len(f) for f in layers]) + len(disconnected) == len(self.nodes)
-        if len(disconnected) > 0:
-            layers.append(disconnected)
-        return layers
+    def num_unlinked_output_nodes(self):
+        return sum(
+            [1 for node in self.out_nodes if len(self.edges_by_to[node.id]) == 0]
+        )
 
     def __call__(self, x: np.ndarray):
         batch_size = x.shape[0]
@@ -175,6 +152,7 @@ class ComputationGraph:
 
         parents_by_node = deepcopy(self.edges_by_to)
 
+        # set input node values
         frontier = set()
         for node in self.inp_nodes:
             node.value = x[:, node.id]
@@ -209,7 +187,7 @@ class ComputationGraph:
         out = np.zeros((batch_size, self.out_dim))
         for i, node in enumerate(self.out_nodes):
             if node.value is None:
-                out[:, i] = np.random.uniform(-1.0, 1.0, size=(batch_size,))
+                out[:, i] = np.zeros((batch_size,))
             else:
                 assert node.value is not None
                 assert node.value.shape[0] == batch_size
@@ -219,6 +197,44 @@ class ComputationGraph:
             node.value = None
 
         return out
+
+
+def candidate_acyclic_edges(graph: ComputationGraph):
+    edges = []
+    g = graph.g
+    for from_node in graph.nodes:
+        preds = nx.ancestors(g, from_node.id)
+        for to_node in graph.hidden_nodes + graph.out_nodes:
+            if from_node.id == to_node.id or to_node.id in preds:
+                continue
+            edges.append((from_node.id, to_node.id))
+    return edges
+
+
+def candidate_acyclic_edges_from(graph: ComputationGraph, edge: Edge):
+    # keep from the same
+    edges = []
+    g = graph.g.copy()
+    g.remove_edge(edge.from_node_id, edge.to_node_id)
+    preds = nx.ancestors(g, edge.from_node_id)
+    for to_node in graph.hidden_nodes + graph.out_nodes:
+        if edge.from_node_id == to_node.id or to_node.id in preds:
+            continue
+        edges.append((edge.from_node_id, to_node.id))
+    return edges
+
+
+def candidate_acyclic_edges_to(graph: ComputationGraph, edge: Edge):
+    # keep to the same
+    edges = []
+    g = graph.g.copy()
+    g.remove_edge(edge.from_node_id, edge.to_node_id)
+    for from_node in graph.nodes:
+        preds = nx.ancestors(g, from_node.id)
+        if from_node.id == edge.to_node_id or edge.to_node_id in preds:
+            continue
+        edges.append((from_node.id, edge.to_node_id))
+    return edges
 
 
 def mutate_graph(
@@ -239,7 +255,7 @@ def mutate_graph(
     variables = deepcopy(graph.variables)
     next_variable_id = 0 if len(variables) == 0 else max(v.id for v in variables) + 1
 
-    layers = graph.bfs()
+    assert nx.is_directed_acyclic_graph(graph.g)
 
     if node_or_edge == 0:
         if structure_or_values == 0 and len(hidden_nodes) > 0:
@@ -260,7 +276,9 @@ def mutate_graph(
                 # add node
                 # note: not adding edge for now, so it will be disconnected
                 new_variable = Constant(next_variable_id, np_random.uniform(0.0, 1.0))
-                new_node = random_node(np_random, next_node_id, variables + [new_variable])
+                new_node = random_node(
+                    np_random, next_node_id, variables + [new_variable]
+                )
                 if new_node.bias_var == new_variable.id:
                     variables.append(new_variable)
                 hidden_nodes.append(new_node)
@@ -279,27 +297,40 @@ def mutate_graph(
         if structure_or_values == 0 and len(edges) > 0:
             # chg edge weight variable
             edge = np_random.choice(edges)
-            weight_or_sign = np_random.choice([0, 1])
-            if weight_or_sign == 0:
+            weight_sign_from_to = np_random.choice([0, 1, 2, 3])
+            if weight_sign_from_to == 0:
+                # weight variable
                 new_variable = Constant(next_variable_id, np_random.uniform(0.0, 1.0))
                 edge.weight_var = np_random.choice(variables + [new_variable]).id
                 if edge.weight_var == new_variable.id:
                     variables.append(new_variable)
-            else:
+            elif weight_sign_from_to == 1:
+                # sign
                 edge.sign *= -1.0
+            elif weight_sign_from_to == 2:
+                # from
+                candidate_edges = candidate_acyclic_edges_to(graph, edge)
+                from_node_id, to_node_id = candidate_edges[
+                    np_random.choice(list(range(len(candidate_edges))))
+                ]
+                edge.from_node_id = from_node_id
+                assert to_node_id == edge.to_node_id
+            elif weight_sign_from_to == 3:
+                # to
+                candidate_edges = candidate_acyclic_edges_from(graph, edge)
+                from_node_id, to_node_id = candidate_edges[
+                    np_random.choice(list(range(len(candidate_edges))))
+                ]
+                edge.to_node_id = to_node_id
+                assert from_node_id == edge.from_node_id
         else:
             add_or_rem = np_random.choice([0, 1])
             if add_or_rem == 0 or len(edges) == 0:
                 # add edge
-                nodes_in_front = [item for sublist in layers[:-1] for item in sublist]
-                from_node_id = np_random.choice(nodes_in_front)
-                for layer_id, layer in enumerate(layers):
-                    if from_node_id in layer:
-                        break
-                nodes_after = [
-                    item for sublist in layers[layer_id + 1 :] for item in sublist
+                candidate_edges = candidate_acyclic_edges(graph)
+                from_node_id, to_node_id = candidate_edges[
+                    np_random.choice(list(range(len(candidate_edges))))
                 ]
-                to_node_id = np_random.choice(nodes_after)
                 variable = np_random.choice(variables).id
                 sign = np_random.choice([-1.0, 1.0])
                 edges.append(
@@ -312,9 +343,13 @@ def mutate_graph(
 
                 # note: doesn't matter if it disconnects an edge
 
-    return ComputationGraph(
+    graph2 = ComputationGraph(
         graph.inp_dim, graph.out_dim, hidden_nodes, output_nodes, edges, variables
     )
+
+    assert nx.is_directed_acyclic_graph(graph2.g)
+
+    return graph2
 
 
 def random_node(
@@ -338,6 +373,7 @@ def random_graph(
         Constant(2, 1 / 2),
         Constant(3, 1 / 3),
         Constant(4, 1 / 4),
+        Constant(5, np.pi),
     ]
     graph = ComputationGraph(
         inp_dim,
@@ -354,20 +390,6 @@ def random_graph(
     while np_random.choice([0, 1]) == 0:
         graph = mutate_graph(np_random, graph)
     return graph
-
-
-def score(graph: ComputationGraph) -> float:
-    env = gym.make("CartPole-v1")
-    obs = env.reset()
-    done = False
-    score = 0
-    while not done:
-        out = graph(np.expand_dims(obs, 0))[0]
-        obs, reward, done, info = env.step(np.argmax(out))
-        score += reward
-    node_penalty = -len(graph.hidden_nodes)
-    edge_penalty = -len(graph.edges)
-    return score + node_penalty + edge_penalty
 
 
 def cartpole_handcoded_test():
@@ -407,33 +429,79 @@ def cartpole_handcoded_test():
     print(score)
 
 
-def evolution(population_size=50, k=5):
-    np_random = np.random.RandomState(seed=0)
+def evolution(population_size=100, elite=3, k=10, mutations=1):
+    # env = gym.make("CartPole-v1")
+    # env = gym.make("MountainCar-v0")
+    env = gym.make("Acrobot-v1")
+    print(env.observation_space)
+    print(env.action_space)
+
+    seed = 0
+    np_random = np.random.RandomState(seed=seed)
+    env.seed(seed)
+    env.action_space.seed(seed)
+
+    def score(graph: ComputationGraph, render=False) -> float:
+        obs = env.reset()
+        done = False
+        score = 0
+        if render:
+            env.render()
+        while not done:
+            out = graph(np.expand_dims(obs, 0))[0]
+            obs, reward, done, info = env.step(np.argmax(out))
+            if render:
+                env.render()
+            score += reward
+        if render:
+            env.render()
+        node_penalty = -len(graph.hidden_nodes)
+        edge_penalty = -len(graph.edges)
+        unlinked_output_penalty = -graph.num_unlinked_output_nodes()
+        return score + node_penalty + edge_penalty + unlinked_output_penalty
+
     population = [
-        random_graph(np_random, 4, 2, min_mutations=5) for i in range(population_size)
+        random_graph(
+            np_random,
+            env.observation_space.shape[0],
+            env.action_space.n,
+            min_mutations=5,
+        )
+        for i in range(population_size)
     ]
+    scores = [score(population[i]) for i in range(population_size)]
 
     def print_best():
         best_i = max(list(range(population_size)), key=lambda i: scores[i])
         print(epoch, max(scores), scores[best_i])
         print(population[best_i])
+        print(population[best_i].num_unlinked_output_nodes(), "unlinked")
+        print(score(population[best_i], render=True))
 
     atexit.register(print_best)
     epoch = 0
     while True:
-        scores = [score(population[i]) for i in range(population_size)]
-        print(epoch, max(scores), scores)
+        print(epoch, max(scores), sum(scores) / population_size)
         sorted_inds = sorted(
             list(range(population_size)), key=lambda i: scores[i], reverse=True
         )
-        top_k = sorted_inds[:k]
         next_population = []
-        for i in top_k:
+        for i in sorted_inds[:elite]:
             next_population.append(population[i])
-            for j in range(population_size // k - 1):
-                next_population.append(mutate_graph(np_random, population[i]))
+            next_population.append(mutate_graph(np_random, population[i]))
+        while len(next_population) != population_size:
+            tournament_inds = np_random.choice(sorted_inds, replace=False, size=k)
+            winner = population[max(tournament_inds, key=lambda i: scores[i])]
+            for _ in range(mutations):
+                winner = mutate_graph(np_random, winner)
+            next_population.append(winner)
         assert len(next_population) == population_size, len(next_population)
+
+        next_scores = [score(next_population[i]) for i in range(population_size)]
+
         population = next_population
+        scores = next_scores
+
         epoch += 1
 
 
