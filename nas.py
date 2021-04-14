@@ -457,7 +457,7 @@ def evolution(population_size=100, elite=3, k=10, mutations=1):
             env.render()
         node_penalty = -len(graph.hidden_nodes)
         edge_penalty = -len(graph.edges)
-        unlinked_output_penalty = -graph.num_unlinked_output_nodes()
+        unlinked_output_penalty = -(graph.num_unlinked_output_nodes() * 1e6)
         return score + node_penalty + edge_penalty + unlinked_output_penalty
 
     population = [
@@ -492,7 +492,9 @@ def evolution(population_size=100, elite=3, k=10, mutations=1):
         while len(next_population) != population_size:
             tournament_inds = np_random.choice(sorted_inds, replace=False, size=k)
             winner = population[max(tournament_inds, key=lambda i: scores[i])]
+            # TODO mutation rate based on number of params
             for _ in range(mutations):
+                # TODO coin flip for these mutations?
                 winner = mutate_graph(np_random, winner)
             next_population.append(winner)
         assert len(next_population) == population_size, len(next_population)
