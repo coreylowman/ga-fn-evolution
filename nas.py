@@ -200,41 +200,41 @@ class ComputationGraph:
 
 
 def candidate_acyclic_edges(graph: ComputationGraph):
-    edges = []
+    edges = set()
     g = graph.g
     for from_node in graph.nodes:
         preds = nx.ancestors(g, from_node.id)
         for to_node in graph.hidden_nodes + graph.out_nodes:
             if from_node.id == to_node.id or to_node.id in preds:
                 continue
-            edges.append((from_node.id, to_node.id))
-    return edges
+            edges.add((from_node.id, to_node.id))
+    return list(edges - set(g.edges))
 
 
 def candidate_acyclic_edges_from(graph: ComputationGraph, edge: Edge):
     # keep from the same
-    edges = []
+    edges = set()
     g = graph.g.copy()
     g.remove_edge(edge.from_node_id, edge.to_node_id)
     preds = nx.ancestors(g, edge.from_node_id)
     for to_node in graph.hidden_nodes + graph.out_nodes:
         if edge.from_node_id == to_node.id or to_node.id in preds:
             continue
-        edges.append((edge.from_node_id, to_node.id))
-    return edges
+        edges.add((edge.from_node_id, to_node.id))
+    return list(edges - set(g.edges))
 
 
 def candidate_acyclic_edges_to(graph: ComputationGraph, edge: Edge):
     # keep to the same
-    edges = []
+    edges = set()
     g = graph.g.copy()
     g.remove_edge(edge.from_node_id, edge.to_node_id)
     for from_node in graph.nodes:
         preds = nx.ancestors(g, from_node.id)
         if from_node.id == edge.to_node_id or edge.to_node_id in preds:
             continue
-        edges.append((from_node.id, edge.to_node_id))
-    return edges
+        edges.add((from_node.id, edge.to_node_id))
+    return list(edges - set(g.edges))
 
 
 def mutate_graph(
@@ -431,8 +431,8 @@ def cartpole_handcoded_test():
 
 def evolution(population_size=100, elite=3, k=10, mutations=1):
     # env = gym.make("CartPole-v1")
-    # env = gym.make("MountainCar-v0")
-    env = gym.make("Acrobot-v1")
+    env = gym.make("MountainCar-v0")
+    # env = gym.make("Acrobot-v1")
     print(env.observation_space)
     print(env.action_space)
 
@@ -455,10 +455,12 @@ def evolution(population_size=100, elite=3, k=10, mutations=1):
             score += reward
         if render:
             env.render()
-        node_penalty = -len(graph.hidden_nodes)
-        edge_penalty = -len(graph.edges)
-        unlinked_output_penalty = -(graph.num_unlinked_output_nodes() * 1e6)
-        return score + node_penalty + edge_penalty + unlinked_output_penalty
+
+        # score -= len(graph.hidden_nodes)
+        # score -= len(graph.edges)
+        score += nx.average_node_connectivity(graph.g)
+        score += -(graph.num_unlinked_output_nodes() * 1e6)
+        return score
 
     population = [
         random_graph(
@@ -493,7 +495,8 @@ def evolution(population_size=100, elite=3, k=10, mutations=1):
             tournament_inds = np_random.choice(sorted_inds, replace=False, size=k)
             winner = population[max(tournament_inds, key=lambda i: scores[i])]
             # TODO mutation rate based on number of params
-            for _ in range(mutations):
+            # for _ in range(mutations):
+            while np_random.uniform(0, 1) < 0.5:
                 # TODO coin flip for these mutations?
                 winner = mutate_graph(np_random, winner)
             next_population.append(winner)
